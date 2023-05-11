@@ -183,7 +183,7 @@ async function getClientInfo(id_assinador) {
 
 async function getAndUploadPDF(id_assinador, deal_id, destPath) {
   await downloadPDF(
-    `https://assinador.previsa.com.br/api/documents/${id_assinador}/content`,
+    `https://assinador.previsa.com.br/api/documents/${id_assinador}/content?type=PrinterFriendlyVersion`,
     destPath
   );
   log(`PDF salvo em ${destPath}`);
