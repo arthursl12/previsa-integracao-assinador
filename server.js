@@ -2,6 +2,7 @@ require("dotenv").config();
 const http = require("http");
 const https = require("https");
 const axios = require("axios");
+var FormData = require("form-data");
 
 const path = require("path");
 const { sendMailHTMLWithAttachments } = require("./emailer");
@@ -12,6 +13,30 @@ const { log } = logLib;
 const fs = require("fs");
 const port = 3000;
 PDF_BASE_FOLDER = "pdfs/";
+
+async function uploadPDFAsAttachment(filePath, userKey) {
+  try {
+    const data = new FormData();
+    data.append("file", fs.createReadStream(filePath));
+
+    const config = {
+      method: "post",
+      maxBodyLength: Infinity,
+      url: "https://public-api2.ploomes.com/Attachments",
+      headers: {
+        "User-key": userKey,
+        ...data.headers,
+      },
+      data: data,
+    };
+
+    const response = await axios(config);
+    return response.data;
+  } catch (error) {
+    console.error(error);
+    throw error;
+  }
+}
 
 function stripSpaces(str) {
   return str.replace(/^\s+|\s+$/g, "");
@@ -54,39 +79,24 @@ function downloadPDF(url, filename) {
 }
 
 function sendAPIRequest(url, method, headers, body) {
-  return new Promise((resolve, reject) => {
-    const options = {
-      method: method,
-      headers: headers,
-    };
+  const config = {
+    method: method,
+    url: url,
+    headers: headers,
+    data: body,
+  };
 
-    const request = https.request(url, options, (response) => {
-      let data = "";
-
-      response.on("data", (chunk) => {
-        data += chunk;
-      });
-
-      response.on("end", () => {
-        resolve({
-          statusCode: response.statusCode,
-          headers: response.headers,
-          body: data,
-        });
-      });
+  return axios(config)
+    .then((response) => {
+      return {
+        statusCode: response.status,
+        headers: response.headers,
+        body: response.data,
+      };
+    })
+    .catch((error) => {
+      throw error;
     });
-
-    request.on("error", (error) => {
-      reject(error);
-    });
-
-    if (body) {
-      request.write(JSON.stringify(body));
-      // request.write(body);
-    }
-
-    request.end();
-  });
 }
 
 function findDate(deal_data, logfn = console.log) {
@@ -125,6 +135,131 @@ function findDate(deal_data, logfn = console.log) {
   return dataInicio;
 }
 
+async function getClientInfo(id_assinador) {
+  // Obter nome da empresa do assinador
+  let response = await sendAPIRequest(
+    `https://assinador.previsa.com.br/api/documents/${id_assinador}`,
+    "GET",
+    {
+      "X-Api-Key": process.env.SIGNER_PREVISA,
+    }
+  );
+  const contract_data = response.body;
+  const nome_empresa = stripSpaces(contract_data.folder.name);
+  log(`A empresa é ${nome_empresa}`);
+
+  // Obter o informações do cliente do Ploomes
+  response = await sendAPIRequest(
+    `https://public-api2.ploomes.com/Contacts?$filter=Name+eq+'${nome_empresa}'+and+Status/Name+eq+'Ativo'&$expand=Status`,
+    "GET",
+    {
+      "User-key": process.env.PLOOMES_KEY,
+    }
+  );
+  let client_data = response.body;
+  client_data = client_data.value[0];
+  const cnpj = client_data.CNPJ;
+  log(`O CNPJ do cliente é ${cnpj}`);
+
+  // Obter o ID do negócio no estágio 'Ag. Assinatura do contrato'
+  const id_ag_assinatura = 206887;
+  response = await sendAPIRequest(
+    `https://public-api2.ploomes.com/Deals?$filter=ContactName+eq+'${nome_empresa}'+and+StageId+eq+${id_ag_assinatura}&$expand=OtherProperties`,
+    "GET",
+    {
+      "User-key": process.env.PLOOMES_KEY,
+    }
+  );
+  const deal_data = response.body;
+  const deal_id = deal_data.value[0].Id;
+  log(
+    `O ID no Ploomes do seu negócio na fase 'Ag. Assinatura do contrato' é ${deal_id}`
+  );
+
+  // Obter a data de início da repsonsabilidade previsa
+  const dataInicio = findDate(deal_data.value[0]);
+  return [nome_empresa, deal_id, dataInicio, cnpj];
+}
+
+async function getAndUploadPDF(id_assinador, deal_id, destPath) {
+  await downloadPDF(
+    `https://assinador.previsa.com.br/api/documents/${id_assinador}/content`,
+    destPath
+  );
+  log(`PDF salvo em ${destPath}`);
+
+  // Fazer upload do PDF para o Ploomes
+  response = await uploadPDFAsAttachment(destPath, process.env.PLOOMES_KEY);
+  const upload_data = response.value[0];
+  const upload_id = upload_data.Id; // ID do anexo enviado
+  log(`O anexo enviado tem ID ${upload_id}`);
+
+  // Adicionar esse anexo no campo do Ploomes
+  response = await sendAPIRequest(
+    `https://public-api2.ploomes.com/Deals(${deal_id})`,
+    "PATCH",
+    {
+      "User-key": process.env.PLOOMES_KEY,
+    },
+    {
+      OtherProperties: [
+        {
+          FieldKey: "deal_58C31994-98FF-4216-84AC-3C10A30C22A3",
+          IntegerValue: upload_id,
+        },
+      ],
+    }
+  );
+  const patch_response = response.body.value[0];
+  const sucess_upload = patch_response.Id === deal_id ? true : false;
+  return sucess_upload;
+}
+
+async function sendEmails(
+  sucess_upload,
+  nome_empresa,
+  cnpj,
+  dataInicio,
+  destPath
+) {
+  let corpo_base = `Olá,<br><br>O contrato da empresa ${nome_empresa}, de CNPJ: ${cnpj} já foi devidamente assinado no AC e se encontra em anexo.`;
+  let corpo_Comercial = corpo_base;
+  let corpo_GPP = corpo_base;
+  if (!sucess_upload) {
+    corpo_Comercial += `<br><strong>Favor inserí-lo no campo respectivo no estágio no funil 'Oportunidades - Previsa'</strong>`;
+  }
+  corpo_Comercial += `<br><br>Att.`;
+  corpo_GPP += `<br><br>Att.`;
+
+  await sendMailHTMLWithAttachments(
+    // "relacionamento@previsa.com.br,"+
+    // "tayedaribeiro@previsa.com.br,"+
+    // "leonardopereira@previsa.com.br,"+
+    "arthursouto@previsa.com.br",
+    `Contrato já concluído no assinador - ${nome_empresa} - ${cnpj}$`,
+    corpo_Comercial,
+    {
+      filename: `${nome_empresa} ${dataInicio} ${cnpj}.pdf`,
+      path: `${destPath}`,
+    },
+    log
+  );
+
+  await sendMailHTMLWithAttachments(
+    // "carolina@previsa.com.br,"+
+    // "ingridbernardes@previsa.com.br,"+
+    // "leonardopereira@previsa.com.br,"+
+    "arthursouto@previsa.com.br",
+    `Contrato já concluído no assinador - ${nome_empresa} - ${cnpj}$`,
+    corpo_GPP,
+    {
+      filename: `${nome_empresa} ${dataInicio} ${cnpj}.pdf`,
+      path: `${destPath}`,
+    },
+    log
+  );
+}
+
 async function handleWebhookRequest(req, res) {
   if (req.method === "POST" && req.url === "/webhook") {
     let body = "";
@@ -145,95 +280,33 @@ async function handleWebhookRequest(req, res) {
       log(`Received POST from ${ipAddress} for URL ${hostname}${url} `);
 
       const data = await JSON.parse(body);
-      console.log("Webhook data received:", data);
-      const id = data.event.body.data.documents[0].id;
-      const type = data.event.body.data.type;
-      log(`Tipo da operação ${type}`);
+      // console.log("Webhook data received:", data);
+      const id = data.data.id;
+      const type = data.type;
+      log(`Tipo da operação **${type}**`);
 
       if (type === "DocumentConcluded") {
         log(`Requisitando PDF do contrato de id: ${id}`);
-        const pdfname = data.event.body.data.documents[0].name + ".pdf";
-        log(`O PDF tem nome de: ${pdfname}`);
+        const pdfname = data.data.name + ".pdf";
+        log(`O PDF originalmente tem nome de: ${pdfname}`);
 
-        // Obter PDF do assinador
-        const destPath = PDF_BASE_FOLDER + pdfname;
-        await downloadPDF(
-          `https://assinador.previsa.com.br/api/documents/${id}/content`,
+        const [nome_empresa, deal_id, dataInicio, cnpj] = await getClientInfo(
+          id
+        );
+
+        // Obter PDF do assinador e fazer o upload para o Ploomes
+        const destPath =
+          PDF_BASE_FOLDER + `${nome_empresa} ${dataInicio} ${cnpj}.pdf`;
+        const sucess_upload = await getAndUploadPDF(id, deal_id, destPath);
+        log(`O anexo foi preenchido? ${sucess_upload}`);
+
+        // Email coms contratos
+        await sendEmails(
+          sucess_upload,
+          nome_empresa,
+          cnpj,
+          dataInicio,
           destPath
-        );
-        log(`PDF salvo em ${destPath}`);
-
-        // Obter nome da empresa do assinador
-        let response = await sendAPIRequest(
-          `https://assinador.previsa.com.br/api/documents/${id}`,
-          "GET",
-          {
-            "X-Api-Key": process.env.SIGNER_PREVISA,
-          }
-        );
-        const contract_data = await JSON.parse(response.body);
-
-        const nome_empresa = stripSpaces(contract_data.folder.name);
-        log(`A empresa é ${nome_empresa}`);
-
-        // Obter o informações do cliente
-        response = await sendAPIRequest(
-          `https://public-api2.ploomes.com/Contacts?$filter=Name+eq+'${nome_empresa}'+and+Status/Name+eq+'Ativo'&$expand=Status`,
-          "GET",
-          {
-            "User-key": process.env.PLOOMES_KEY,
-          }
-        );
-        let client_data = await JSON.parse(response.body);
-        client_data = client_data.value[0];
-        const cnpj = client_data.CNPJ;
-        log(`O CNPJ do cliente é ${cnpj}`);
-
-        // Obter o ID do negócio no estágio 'Ag. Assinatura do contrato'
-        const id_ag_assinatura = 206887;
-        response = await sendAPIRequest(
-          `https://public-api2.ploomes.com/Deals?$filter=ContactName+eq+'${nome_empresa}'+and+StageId+eq+${id_ag_assinatura}&$expand=OtherProperties`,
-          "GET",
-          {
-            "User-key": process.env.PLOOMES_KEY,
-          }
-        );
-        const deal_data = await JSON.parse(response.body);
-        const deal_id = deal_data.value[0].Id;
-        log(
-          `O ID no Ploomes do seu negócio na fase 'Ag. Assinatura do contrato' é ${deal_id}`
-        );
-
-        // Obter a data de início da repsonsabilidade previsa
-        const dataInicio = findDate(deal_data.value[0]);
-
-        // Email de erro que não conseguiu achar o card
-        await sendMailHTMLWithAttachments(
-          // "relacionamento@previsa.com.br,"+
-          // "tayedaribeiro@previsa.com.br,"+
-          // "leonardopereira@previsa.com.br,"+
-          "arthursouto@previsa.com.br",
-          `Contrato já concluído no assinador - ${nome_empresa} - ${cnpj}$`,
-          `Olá,<br><br>O contrato da empresa ${nome_empresa}, de CNPJ: ${cnpj} já foi devidamente assinado no AC e se encontra em anexo.<br><strong>Favor inserí-lo no campo respectivo no estágio no funil 'Oportunidades - Previsa'</strong><br><br>Att.`,
-          {
-            filename: `${nome_empresa} ${dataInicio} ${cnpj}.pdf`,
-            path: `${destPath}`,
-          },
-          log
-        );
-
-        await sendMailHTMLWithAttachments(
-          // "carolina@previsa.com.br,"+
-          // "ingridbernardes@previsa.com.br,"+
-          // "leonardopereira@previsa.com.br,"+
-          "arthursouto@previsa.com.br",
-          `Contrato já concluído no assinador - ${nome_empresa} - ${cnpj}$`,
-          `Olá,<br><br>O contrato da empresa ${nome_empresa}, de CNPJ: ${cnpj} já foi devidamente assinado no AC e se encontra em anexo.<br>Att.`,
-          {
-            filename: `${nome_empresa} ${dataInicio} ${cnpj}.pdf`,
-            path: `${destPath}`,
-          },
-          log
         );
 
         // Responder com código 200 para o remetente
