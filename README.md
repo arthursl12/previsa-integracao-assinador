@@ -5,6 +5,7 @@ Projeto para integrar o Assinador Previsa com o Ploomes, além de enviar e-mails
 ## Instalação
 - Faça clone ou download do repositório
 - Use `npm install` para instalar as dependências
+- Defina a porta para ser escutada no arquivo `server.js` na variável `port`
 
 ## Utilização
 - A aplicação consiste em um servidor que escuta no endereço `http://localhost:3000` 
